@@ -1,0 +1,13 @@
+{
+  "id": "example",
+  "name": "Example Site Bundle",
+  "version": "0.1.0",
+  "description": "Template bundle with adapter + expander",
+  "domains": ["example.com"],
+  "provides": ["adapter", "expander"],
+  "entry": {
+    "adapter": "adapter.py:register",
+    "expander": "expander.py:discover"
+  },
+  "min_core_version": "0.2.0"
+}
