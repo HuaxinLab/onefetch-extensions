@@ -1,14 +1,6 @@
 {
   "items": [
     {
-      "id": "example",
-      "name": "Example Site Bundle",
-      "version": "0.1.0",
-      "description": "Template bundle with adapter + expander",
-      "domains": ["example.com"],
-      "path": "sites/example"
-    },
-    {
       "id": "geekbang",
       "name": "Geekbang Site Bundle",
       "version": "0.1.0",
