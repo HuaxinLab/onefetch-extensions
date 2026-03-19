@@ -1,0 +1,13 @@
+{
+  "id": "geekbang",
+  "name": "Geekbang Site Bundle",
+  "version": "0.1.0",
+  "description": "Geekbang adapter + expander",
+  "domains": ["b.geekbang.org"],
+  "provides": ["adapter", "expander"],
+  "entry": {
+    "adapter": "adapter.py:GeekbangAdapter",
+    "expander": "expander.py:GeekbangCourseExpander"
+  },
+  "min_core_version": "0.2.0"
+}
