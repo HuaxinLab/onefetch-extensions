@@ -213,12 +213,14 @@ class GeekbangAdapter(BaseAdapter):
     @staticmethod
     def _is_code_block_node(node) -> bool:
         tag = str(getattr(node, "tag", "") or "").lower()
-        if tag in {"pre", "code"}:
+        # Block-level code should be detected conservatively.
+        if tag == "pre":
             return True
         class_attr = str(node.get("class") or "").lower()
         if any(token in class_attr for token in ("codeblock", "code-block", "hljs", "highlight", "language-")):
             return True
-        if node.xpath(".//pre|.//code"):
+        # A descendant <pre> is a strong signal of block code.
+        if node.xpath(".//pre"):
             return True
         return False
 
@@ -595,6 +597,12 @@ class GeekbangAdapter(BaseAdapter):
             return text
 
         raw_html = re.sub(r"(?is)<a\b([^>]*)>(.*?)</a>", _anchor_replace, raw_html)
+        # Preserve inline code semantics inside normal text/list items.
+        raw_html = re.sub(
+            r"(?is)<code\b[^>]*>(.*?)</code>",
+            lambda m: f"`{std_html.unescape(re.sub(r'<[^>]+>', '', m.group(1) or '')).strip()}`",
+            raw_html,
+        )
         plain = re.sub(r"(?is)<[^>]+>", "", raw_html)
         plain = std_html.unescape(plain)
         return GeekbangAdapter._clean_text(plain)
