@@ -124,6 +124,10 @@ class GeekbangAdapter(BaseAdapter):
             # Skip script/style fragments that may appear in rendered DOM.
             if child.tag in {"script", "style"}:
                 continue
+            heading_block = GeekbangAdapter._extract_heading_block(child)
+            if heading_block:
+                blocks.append(heading_block)
+                continue
             if GeekbangAdapter._is_code_block_node(child):
                 code_block = GeekbangAdapter._extract_code_block(child)
                 if code_block:
@@ -177,6 +181,22 @@ class GeekbangAdapter(BaseAdapter):
         body = "\n".join(block for block in blocks if block).strip()
         body, images = GeekbangAdapter._filter_images_and_markers(body, images)
         return body, images
+
+    @staticmethod
+    def _extract_heading_block(node) -> str:
+        tag = str(getattr(node, "tag", "") or "").lower()
+        if tag not in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            return ""
+        try:
+            source_level = int(tag[1])
+        except Exception:
+            source_level = 1
+        # Note template uses "# title" + "## 正文", so article headings are shifted by +2.
+        level = max(3, min(source_level + 2, 6))
+        text = GeekbangAdapter._text_with_links(node)
+        if not text:
+            return ""
+        return f"{'#' * level} {text}"
 
     @staticmethod
     def _is_list_node(node) -> bool:
