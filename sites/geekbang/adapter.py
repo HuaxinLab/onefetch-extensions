@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from lxml import html
 
-from onefetch.adapters.base import BaseAdapter, node_to_text
+from onefetch.adapters.base import BaseAdapter
 from onefetch.adapters.generic_html import GenericHtmlAdapter
 from onefetch.models import FeedEntry
 from onefetch.router import normalize_url
@@ -87,9 +87,9 @@ class GeekbangAdapter(BaseAdapter):
             return None
         wrapper = wrappers[0]
         blocks: list[str] = []
-        images: list[str] = []
+        images: list[dict] = []
         for node in wrapper.xpath(".//*[contains(@class,'article-typo')]"):
-            text, imgs = node_to_text(node, image_placeholders=True)
+            text, imgs = GeekbangAdapter._extract_rich_body(node)
             cleaned = GeekbangAdapter._cleanup_body(text)
             if cleaned:
                 blocks.append(cleaned)
@@ -119,12 +119,13 @@ class GeekbangAdapter(BaseAdapter):
     def _extract_rich_body(node) -> tuple[str, list[dict]]:
         blocks: list[str] = []
         images: list[dict] = []
+        heading_base = GeekbangAdapter._heading_base_level(node)
 
         for child in node.xpath("./*"):
             # Skip script/style fragments that may appear in rendered DOM.
             if child.tag in {"script", "style"}:
                 continue
-            heading_block = GeekbangAdapter._extract_heading_block(child)
+            heading_block = GeekbangAdapter._extract_heading_block(child, heading_base=heading_base)
             if heading_block:
                 blocks.append(heading_block)
                 continue
@@ -183,7 +184,18 @@ class GeekbangAdapter(BaseAdapter):
         return body, images
 
     @staticmethod
-    def _extract_heading_block(node) -> str:
+    def _heading_base_level(root_node) -> int:
+        levels: list[int] = []
+        for child in root_node.xpath("./*"):
+            tag = str(getattr(child, "tag", "") or "").lower()
+            if tag.startswith("h") and tag[1:].isdigit():
+                levels.append(int(tag[1:]))
+        if not levels:
+            return 0
+        return min(levels)
+
+    @staticmethod
+    def _extract_heading_block(node, *, heading_base: int) -> str:
         tag = str(getattr(node, "tag", "") or "").lower()
         if tag not in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             return ""
@@ -191,8 +203,10 @@ class GeekbangAdapter(BaseAdapter):
             source_level = int(tag[1])
         except Exception:
             source_level = 1
-        # Note template uses "# title" + "## 正文", so article headings are shifted by +2.
-        level = max(3, min(source_level + 2, 6))
+        # Note template uses "# title" + "## 正文".
+        # Normalize article headings dynamically: shallowest heading becomes ###.
+        base = heading_base if heading_base > 0 else 1
+        level = max(3, min(source_level - base + 3, 6))
         text = GeekbangAdapter._text_with_links(node)
         if not text:
             return ""
