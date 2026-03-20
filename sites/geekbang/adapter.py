@@ -134,6 +134,11 @@ class GeekbangAdapter(BaseAdapter):
                 if list_block:
                     blocks.append(list_block)
                 continue
+            if GeekbangAdapter._is_table_node(child):
+                table_block = GeekbangAdapter._extract_table_block(child)
+                if table_block:
+                    blocks.append(table_block)
+                continue
 
             img_nodes = child.xpath(".//img")
             if img_nodes:
@@ -209,6 +214,51 @@ class GeekbangAdapter(BaseAdapter):
             if parent is not None:
                 parent.remove(nested)
         return GeekbangAdapter._text_with_links(clone)
+
+    @staticmethod
+    def _is_table_node(node) -> bool:
+        tag = str(getattr(node, "tag", "") or "").lower()
+        if tag == "table":
+            return True
+        return bool(node.xpath(".//table"))
+
+    @staticmethod
+    def _extract_table_block(node) -> str:
+        table = node
+        if str(getattr(node, "tag", "") or "").lower() != "table":
+            candidates = node.xpath(".//table")
+            if not candidates:
+                return ""
+            table = candidates[0]
+
+        rows: list[list[str]] = []
+        header_by_th = False
+        for tr in table.xpath(".//tr"):
+            cells = tr.xpath("./th|./td")
+            if not cells:
+                continue
+            if tr.xpath("./th"):
+                header_by_th = True
+            vals: list[str] = []
+            for cell in cells:
+                text = GeekbangAdapter._clean_text(cell.text_content())
+                vals.append(text.replace("|", r"\|"))
+            rows.append(vals)
+        if not rows:
+            return ""
+        col_count = max(len(r) for r in rows)
+        normalized_rows = [r + [""] * (col_count - len(r)) for r in rows]
+        header = normalized_rows[0]
+        body = normalized_rows[1:]
+        if not header_by_th and not body:
+            return ""
+        lines = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(["---"] * col_count) + " |",
+        ]
+        for row in body:
+            lines.append("| " + " | ".join(row) + " |")
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _is_code_block_node(node) -> bool:
