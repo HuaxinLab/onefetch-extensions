@@ -18,6 +18,14 @@ This repository is the extension source for OneFetch. The core repo can install/
 |---|---|---|---|---|
 | `geekbang` | `b.geekbang.org` | `adapter`, `expander` | active | Course intro/detail parsing and URL expansion |
 
+## Development
+
+- Guide: `DEVELOPMENT.md`
+- Release check:
+  - `bash scripts/release_extensions_check.sh`
+- Migrated adapter regression tests:
+  - `ONEFETCH_CORE_PATH=/path/to/onefetch .venv/bin/python -m pytest -q tests/test_geekbang_adapter.py`
+
 ## Development Template
 
 `sites/example` is kept as a local template/reference and is **not** listed in `index.json`.
@@ -27,6 +35,11 @@ Only entries in `index.json` are installable by `onefetch ext install`.
 
 ```text
 index.json
+DEVELOPMENT.md
+scripts/
+  release_extensions_check.sh
+tests/
+  test_geekbang_adapter.py
 sites/
   geekbang/
     manifest.json
