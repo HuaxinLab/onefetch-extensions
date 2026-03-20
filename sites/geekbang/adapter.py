@@ -96,6 +96,7 @@ class GeekbangAdapter(BaseAdapter):
                 images.extend(imgs)
         if not blocks:
             return None
+        body = GeekbangAdapter._renumber_img_placeholders("\n\n".join(blocks))
         title = GeekbangAdapter._first_text(
             tree,
             "//*[contains(@class,'ColumnInfoPC_title')] | //*[contains(@class,'ColumnInfoPC_column-title')]",
@@ -108,7 +109,7 @@ class GeekbangAdapter(BaseAdapter):
             "title": title,
             "author": author,
             "published_at": None,
-            "body": "\n\n".join(blocks),
+            "body": body,
             "images": images,
         }
 
@@ -221,4 +222,15 @@ class GeekbangAdapter(BaseAdapter):
         text = "\n".join(cleaned_lines).strip()
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text
+
+    @staticmethod
+    def _renumber_img_placeholders(text: str) -> str:
+        seq = 0
+
+        def _replace(match: re.Match[str]) -> str:
+            nonlocal seq
+            seq += 1
+            return f"[IMG:{seq}]"
+
+        return re.sub(r"\[IMG:\d+\]", _replace, text or "")
     _CST_TZ = timezone(timedelta(hours=8))
