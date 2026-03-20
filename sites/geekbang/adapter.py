@@ -88,13 +88,28 @@ class GeekbangAdapter(BaseAdapter):
         wrapper = wrappers[0]
         blocks: list[str] = []
         images: list[dict] = []
-        for node in wrapper.xpath(".//*[contains(@class,'article-typo')]"):
-            text, imgs = GeekbangAdapter._extract_rich_body(node)
-            cleaned = GeekbangAdapter._cleanup_body(text)
-            if cleaned:
-                blocks.append(cleaned)
-            if imgs:
-                images.extend(imgs)
+        section_nodes = wrapper.xpath("./*[contains(@class,'IntroPC_intro-item')]")
+        if section_nodes:
+            for section in section_nodes:
+                section_title = GeekbangAdapter._first_text(section, ".//*[contains(@class,'IntroPC_title')][1]")
+                if section_title:
+                    blocks.append(f"### {section_title}")
+                for node in section.xpath(".//*[contains(@class,'article-typo')]"):
+                    text, imgs = GeekbangAdapter._extract_rich_body(node)
+                    cleaned = GeekbangAdapter._cleanup_body(text)
+                    if cleaned:
+                        blocks.append(cleaned)
+                    if imgs:
+                        images.extend(imgs)
+        else:
+            # Fallback for possible layout changes.
+            for node in wrapper.xpath(".//*[contains(@class,'article-typo')]"):
+                text, imgs = GeekbangAdapter._extract_rich_body(node)
+                cleaned = GeekbangAdapter._cleanup_body(text)
+                if cleaned:
+                    blocks.append(cleaned)
+                if imgs:
+                    images.extend(imgs)
         if not blocks:
             return None
         body = GeekbangAdapter._renumber_img_placeholders("\n".join(blocks))
