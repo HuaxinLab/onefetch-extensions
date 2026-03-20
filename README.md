@@ -16,7 +16,7 @@ This repository is the extension source for OneFetch. The core repo can install/
 
 | id | Domains | Provides | Status | Notes |
 |---|---|---|---|---|
-| `geekbang` | `b.geekbang.org` | `adapter`, `expander` | active | Course intro/detail parsing and URL expansion |
+| `geekbang` | `b.geekbang.org` | `adapter`, `expander` | active | Course intro/detail parsing, URL expansion, link-preserving markdown output, structured image metadata (`index/src/alt/href` in feed) |
 
 ## Development
 

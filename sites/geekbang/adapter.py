@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as std_html
 import re
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -41,9 +42,9 @@ class GeekbangAdapter(BaseAdapter):
                 body = self._cleanup_body(str(chosen.get("body") or ""))
                 if body:
                     feed.body = body[:60000]
-                images = list(chosen.get("images") or [])
-                if images:
-                    feed.images = images
+                images = self._normalize_image_entries(list(chosen.get("images") or []))
+                # Always override fallback images once specialized extraction succeeds.
+                feed.images = images
                 feed.metadata = {
                     **(feed.metadata or {}),
                     "content_kind": "detail" if detail else "intro",
@@ -96,7 +97,8 @@ class GeekbangAdapter(BaseAdapter):
                 images.extend(imgs)
         if not blocks:
             return None
-        body = GeekbangAdapter._renumber_img_placeholders("\n\n".join(blocks))
+        body = GeekbangAdapter._renumber_img_placeholders("\n".join(blocks))
+        body, images = GeekbangAdapter._filter_images_and_markers(body, images)
         title = GeekbangAdapter._first_text(
             tree,
             "//*[contains(@class,'ColumnInfoPC_title')] | //*[contains(@class,'ColumnInfoPC_column-title')]",
@@ -114,13 +116,23 @@ class GeekbangAdapter(BaseAdapter):
         }
 
     @staticmethod
-    def _extract_rich_body(node) -> tuple[str, list[str]]:
+    def _extract_rich_body(node) -> tuple[str, list[dict]]:
         blocks: list[str] = []
-        images: list[str] = []
+        images: list[dict] = []
 
         for child in node.xpath("./*"):
             # Skip script/style fragments that may appear in rendered DOM.
             if child.tag in {"script", "style"}:
+                continue
+            if GeekbangAdapter._is_code_block_node(child):
+                code_block = GeekbangAdapter._extract_code_block(child)
+                if code_block:
+                    blocks.append(code_block)
+                continue
+            if GeekbangAdapter._is_list_node(child):
+                list_block = GeekbangAdapter._extract_list_block(child)
+                if list_block:
+                    blocks.append(list_block)
                 continue
 
             img_nodes = child.xpath(".//img")
@@ -134,7 +146,11 @@ class GeekbangAdapter(BaseAdapter):
                         continue
                     if "svg+xml" in src or "1px" in src:
                         continue
-                    images.append(src)
+                    if GeekbangAdapter._is_decorative_image(img, src):
+                        continue
+                    alt = GeekbangAdapter._clean_text(str(img.get("alt") or ""))
+                    href = GeekbangAdapter._image_href(img)
+                    images.append({"src": src, "alt": alt, "href": href})
                     idx = len(images)
                     marker_indices.append(idx)
                     blocks.append(f"[IMG:{idx}]")
@@ -145,12 +161,403 @@ class GeekbangAdapter(BaseAdapter):
                         blocks.append(f"[IMG_CAPTION:{idx}] {caption}")
                 continue
 
-            text = GeekbangAdapter._clean_text(child.text_content())
+            text = GeekbangAdapter._text_with_links(child)
             if text:
-                blocks.append(text)
+                code_block = GeekbangAdapter._render_compact_code_from_text(text)
+                if code_block:
+                    blocks.append(code_block)
+                else:
+                    blocks.append(text)
 
-        body = "\n\n".join(block for block in blocks if block).strip()
+        body = "\n".join(block for block in blocks if block).strip()
+        body, images = GeekbangAdapter._filter_images_and_markers(body, images)
         return body, images
+
+    @staticmethod
+    def _is_list_node(node) -> bool:
+        tag = str(getattr(node, "tag", "") or "").lower()
+        if tag in {"ul", "ol"}:
+            return True
+        return bool(node.xpath("./li"))
+
+    @staticmethod
+    def _extract_list_block(node, *, depth: int = 0) -> str:
+        tag = str(getattr(node, "tag", "") or "").lower()
+        ordered = tag == "ol"
+        items = node.xpath("./li")
+        if not items:
+            return ""
+        lines: list[str] = []
+        for idx, li in enumerate(items, start=1):
+            prefix = f"{idx}. " if ordered else "- "
+            indent = "  " * depth
+            content = GeekbangAdapter._extract_list_item_text(li)
+            if content:
+                lines.append(f"{indent}{prefix}{content}")
+            nested_lists = li.xpath("./ul|./ol")
+            for nested in nested_lists:
+                nested_text = GeekbangAdapter._extract_list_block(nested, depth=depth + 1)
+                if nested_text:
+                    lines.append(nested_text)
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _extract_list_item_text(li_node) -> str:
+        clone = deepcopy(li_node)
+        for nested in clone.xpath(".//ul|.//ol|.//img|.//script|.//style"):
+            parent = nested.getparent()
+            if parent is not None:
+                parent.remove(nested)
+        return GeekbangAdapter._text_with_links(clone)
+
+    @staticmethod
+    def _is_code_block_node(node) -> bool:
+        tag = str(getattr(node, "tag", "") or "").lower()
+        if tag in {"pre", "code"}:
+            return True
+        class_attr = str(node.get("class") or "").lower()
+        if any(token in class_attr for token in ("codeblock", "code-block", "hljs", "highlight", "language-")):
+            return True
+        if node.xpath(".//pre|.//code"):
+            return True
+        return False
+
+    @staticmethod
+    def _extract_code_block(node) -> str:
+        lang = GeekbangAdapter._detect_code_language(node)
+        raw = (node.text_content() or "").replace("\u00a0", " ").replace("\u200b", "")
+        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.rstrip() for line in raw.split("\n")]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            return ""
+        if GeekbangAdapter._should_reflow_compact_code(lines, lang):
+            reflowed = GeekbangAdapter._reflow_compact_code("\n".join(lines))
+            if reflowed and len(reflowed) > len(lines):
+                lines = reflowed
+        if lines and lines[0].strip().startswith("```"):
+            return "\n".join(lines).strip()
+        fence = f"```{lang}" if lang else "```"
+        return f"{fence}\n" + "\n".join(lines) + "\n```"
+
+    @staticmethod
+    def _detect_code_language(node) -> str:
+        candidates = [
+            str(node.get("data-language") or ""),
+            str(node.get("data-lang") or ""),
+            str(node.get("language") or ""),
+            str(node.get("class") or ""),
+        ]
+        for item in candidates:
+            low = item.lower()
+            m = re.search(r"language-([a-z0-9_+-]+)", low)
+            if m:
+                return m.group(1)
+            if low in {"python", "java", "javascript", "typescript", "go", "rust", "c", "cpp", "bash", "shell", "json", "yaml", "sql"}:
+                return low
+        return ""
+
+    @staticmethod
+    def _image_href(img_node) -> str:
+        href_values = img_node.xpath("ancestor::a[1]/@href")
+        href = str(href_values[0]).strip() if href_values else ""
+        if href.startswith("//"):
+            return "https:" + href
+        return href
+
+    @staticmethod
+    def _should_reflow_compact_code(lines: list[str], lang: str) -> bool:
+        if not lines:
+            return False
+        compact = [line for line in lines if line.strip()]
+        if len(compact) > 2:
+            return False
+        joined = "\n".join(compact).strip()
+        if len(joined) < 120:
+            return False
+        low = joined.lower()
+        python_defs = len(re.findall(r"\b(def|class)\s+[a-zA-Z_][a-zA-Z0-9_]*", low))
+        if python_defs < 2:
+            python_defs = low.count("def ")
+        if python_defs >= 2:
+            return True
+        score = 0
+        for token in (
+            ";",
+            "{",
+            "}",
+            "=>",
+            "function ",
+            "const ",
+            "let ",
+            "var ",
+            "return ",
+            "if(",
+            "if (",
+            "for(",
+            "for (",
+            "while(",
+            "while (",
+            "import ",
+            "class ",
+            "def ",
+        ):
+            if token in low:
+                score += 1
+        if lang.lower() in {"javascript", "typescript", "java", "c", "cpp", "go", "rust", "python", "bash", "shell"}:
+            score += 1
+        return score >= 4
+
+    @staticmethod
+    def _reflow_compact_code(text: str) -> list[str]:
+        source = (text or "").strip()
+        if not source:
+            return []
+        source = re.sub(
+            r"(?<!\n)\s+(def\s+[^\s\(]+\s*\()",
+            r"\n\1",
+            source,
+        )
+        source = re.sub(
+            r"(?<!\n)(?<!\s)(def\s+[^\s\(]+\s*\()",
+            r"\n\1",
+            source,
+        )
+        source = re.sub(
+            r"(?<!\n)\s+(class\s+[^\s\(:]+\s*[:\(])",
+            r"\n\1",
+            source,
+        )
+        source = re.sub(
+            r"(?<!\n)(?<!\s)(class\s+[^\s\(:]+\s*[:\(])",
+            r"\n\1",
+            source,
+        )
+        source = re.sub(
+            r"(?<!\n)\s+(if\s+__name__\s*==\s*['\"]__main__['\"]\s*:)",
+            r"\n\1",
+            source,
+        )
+        source = re.sub(
+            r"(?<!\n)(?<!\s)(if\s+__name__\s*==\s*['\"]__main__['\"]\s*:)",
+            r"\n\1",
+            source,
+        )
+
+        lines: list[str] = []
+        buf: list[str] = []
+        indent = 0
+        in_single = False
+        in_double = False
+        escape = False
+        unit = "    "
+
+        def flush_line(*, use_current_indent: bool = True) -> None:
+            nonlocal buf
+            item = "".join(buf).strip()
+            buf = []
+            if not item:
+                return
+            prefix = unit * (indent if use_current_indent else max(0, indent - 1))
+            lines.append(prefix + item)
+
+        for ch in source:
+            if escape:
+                buf.append(ch)
+                escape = False
+                continue
+            if ch == "\\" and (in_single or in_double):
+                buf.append(ch)
+                escape = True
+                continue
+            if in_single:
+                buf.append(ch)
+                if ch == "'":
+                    in_single = False
+                continue
+            if in_double:
+                buf.append(ch)
+                if ch == '"':
+                    in_double = False
+                continue
+            if ch == "'":
+                buf.append(ch)
+                in_single = True
+                continue
+            if ch == '"':
+                buf.append(ch)
+                in_double = True
+                continue
+
+            if ch == "{":
+                buf.append(ch)
+                flush_line()
+                indent += 1
+                continue
+            if ch == "}":
+                flush_line()
+                indent = max(0, indent - 1)
+                lines.append((unit * indent) + "}")
+                continue
+            if ch == ";":
+                if lines and lines[-1].rstrip().endswith("}") and not buf:
+                    lines[-1] = lines[-1] + ";"
+                else:
+                    buf.append(ch)
+                    flush_line()
+                continue
+            if ch == "\n":
+                flush_line()
+                continue
+            buf.append(ch)
+
+        flush_line()
+        return [line for line in lines if line.strip()]
+
+    @staticmethod
+    def _render_compact_code_from_text(text: str) -> str:
+        candidate = (text or "").strip()
+        if not candidate:
+            return ""
+        if not GeekbangAdapter._looks_like_compact_code_text(candidate):
+            return ""
+        lines = GeekbangAdapter._reflow_compact_code(candidate)
+        if len(lines) <= 1:
+            return ""
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    @staticmethod
+    def _looks_like_compact_code_text(text: str) -> bool:
+        candidate = (text or "").strip()
+        if len(candidate) < 180:
+            return False
+        low = candidate.lower()
+        python_defs = len(re.findall(r"\b(def|class)\s+[a-zA-Z_][a-zA-Z0-9_]*", low))
+        if python_defs < 2:
+            python_defs = low.count("def ")
+        if python_defs >= 2:
+            return True
+        score = 0
+        for token in (
+            ";",
+            "{",
+            "}",
+            "=>",
+            "function ",
+            "const ",
+            "let ",
+            "var ",
+            "return ",
+            "if(",
+            "if (",
+            "for(",
+            "for (",
+            "while(",
+            "while (",
+            "import ",
+        ):
+            if token in low:
+                score += 1
+        return score >= 4
+
+    @staticmethod
+    def _is_decorative_image(node, src: str) -> bool:
+        low_src = (src or "").lower()
+        if any(
+            key in low_src
+            for key in (
+                "/img/logo",
+                "logo-normal",
+                "empty-comment",
+                "avatar",
+                "robot",
+                "chatbot",
+                "assistant",
+                "icon",
+            )
+        ):
+            return True
+
+        if node is not None:
+            attrs = " ".join(
+                str(node.get(k) or "")
+                for k in ("class", "id", "alt", "title", "data-testid", "aria-label")
+            ).lower()
+            if any(
+                key in attrs
+                for key in ("logo", "avatar", "author", "chat", "robot", "assistant", "icon", "comment")
+            ):
+                return True
+
+            for key in ("width", "height"):
+                value = str(node.get(key) or "").strip().lower().replace("px", "")
+                if value.isdigit() and int(value) <= 64:
+                    return True
+
+        return False
+
+    @staticmethod
+    def _filter_images_and_markers(body: str, images: list) -> tuple[str, list]:
+        if not body or not images:
+            return body, images
+        kept: list[str] = []
+        index_map: dict[int, int] = {}
+        for old_idx, src in enumerate(images, start=1):
+            image_src = GeekbangAdapter._image_src(src)
+            if GeekbangAdapter._is_decorative_image(None, image_src):
+                continue
+            index_map[old_idx] = len(kept) + 1
+            kept.append(src)
+        if len(kept) == len(images):
+            return body, images
+
+        output_lines: list[str] = []
+        for raw in body.splitlines():
+            line = raw.strip()
+            m_img = re.fullmatch(r"\[IMG:(\d+)\]", line)
+            if m_img:
+                new_idx = index_map.get(int(m_img.group(1)))
+                if new_idx:
+                    output_lines.append(f"[IMG:{new_idx}]")
+                continue
+
+            m_cap = re.fullmatch(r"\[IMG_CAPTION:(\d+)\](?:\s*(.*))?", line)
+            if m_cap:
+                new_idx = index_map.get(int(m_cap.group(1)))
+                if new_idx:
+                    caption = (m_cap.group(2) or "").strip()
+                    output_lines.append(f"[IMG_CAPTION:{new_idx}] {caption}".rstrip())
+                continue
+            output_lines.append(raw)
+        cleaned = "\n".join(output_lines)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned, kept
+
+    @staticmethod
+    def _image_src(image) -> str:
+        if isinstance(image, dict):
+            return str(image.get("src") or "").strip()
+        return str(image or "").strip()
+
+    @staticmethod
+    def _normalize_image_entries(images: list) -> list[dict]:
+        rows: list[dict] = []
+        for raw in images or []:
+            if isinstance(raw, dict):
+                src = str(raw.get("src") or "").strip()
+                alt = str(raw.get("alt") or "").strip()
+                href = str(raw.get("href") or "").strip()
+            else:
+                src = str(raw or "").strip()
+                alt = ""
+                href = ""
+            if not src:
+                continue
+            rows.append({"src": src, "alt": alt, "href": href})
+        return rows
 
     @staticmethod
     def _text_without_images(node) -> str:
@@ -168,6 +575,29 @@ class GeekbangAdapter(BaseAdapter):
             if value:
                 return value
         return ""
+
+    @staticmethod
+    def _text_with_links(node) -> str:
+        raw_html = html.tostring(node, encoding="unicode", method="html")
+        raw_html = re.sub(r"(?i)<br\s*/?>", "\n", raw_html)
+
+        def _anchor_replace(match: re.Match[str]) -> str:
+            attrs = match.group(1) or ""
+            inner = match.group(2) or ""
+            href_match = re.search(r'href\s*=\s*["\']([^"\']+)["\']', attrs, flags=re.IGNORECASE)
+            href = href_match.group(1).strip() if href_match else ""
+            if href.startswith("//"):
+                href = "https:" + href
+            text = re.sub(r"<[^>]+>", "", inner or "")
+            text = std_html.unescape(text).strip()
+            if href and text:
+                return f"[{text}]({href})"
+            return text
+
+        raw_html = re.sub(r"(?is)<a\b([^>]*)>(.*?)</a>", _anchor_replace, raw_html)
+        plain = re.sub(r"(?is)<[^>]+>", "", raw_html)
+        plain = std_html.unescape(plain)
+        return GeekbangAdapter._clean_text(plain)
 
     @staticmethod
     def _parse_date(value: str):
@@ -193,9 +623,10 @@ class GeekbangAdapter(BaseAdapter):
 
     @staticmethod
     def _cleanup_body(value: str) -> str:
-        text = GeekbangAdapter._clean_text(value)
-        if not text:
-            return text
+        text = (value or "").replace("\u00a0", " ").replace("\u200b", "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not text.strip():
+            return ""
         noise_patterns = [
             r"We'?re sorry but member\.b\.geekbang\.com doesn't work properly without JavaScript enabled\.?",
             r"Please enable it to continue\.?",
@@ -210,9 +641,19 @@ class GeekbangAdapter(BaseAdapter):
             r"^问好$",
         ]
         cleaned_lines: list[str] = []
+        in_fence = False
         for line in text.splitlines():
             item = line.strip()
+            if item.startswith("```"):
+                in_fence = not in_fence
+                cleaned_lines.append("```" if item == "```" else item)
+                continue
+            if in_fence:
+                cleaned_lines.append(line.rstrip())
+                continue
             if not item:
+                if cleaned_lines and cleaned_lines[-1] != "":
+                    cleaned_lines.append("")
                 continue
             if any(re.search(pattern, item) for pattern in noise_patterns):
                 continue

@@ -72,7 +72,40 @@ def test_detail_extracts_author_published_and_image_caption() -> None:
     assert "[IMG:1]" in payload["body"]
     assert "[IMG_CAPTION:1] 图片说明文案" in payload["body"]
     assert "课程目录 噪音" not in payload["body"]
-    assert payload["images"] == ["https://static001.geekbang.org/resource/a.png"]
+    assert payload["images"] == [
+        {
+            "src": "https://static001.geekbang.org/resource/a.png",
+            "alt": "",
+            "href": "",
+        }
+    ]
+
+
+def test_detail_preserves_text_links_and_image_href() -> None:
+    adapter_cls = _load_geekbang_adapter_class()
+    tree = html.fromstring(
+        """
+        <html><body>
+          <div class="ArticleContent_audio-course-wrapper_251E1">
+            <div class="ArticleContent_desc_17GmP">作者</div>
+            <div class="ProseMirror">
+              <p>参考：<a href="https://example.com/ref">官方文档</a></p>
+              <p><a href="https://example.com/full"><img src="https://img.example.com/a.jpg" alt="示意图"/></a></p>
+            </div>
+          </div>
+        </body></html>
+        """
+    )
+    payload = adapter_cls._extract_detail_content(tree)
+    assert payload is not None
+    assert "[官方文档](https://example.com/ref)" in payload["body"]
+    assert payload["images"] == [
+        {
+            "src": "https://img.example.com/a.jpg",
+            "alt": "示意图",
+            "href": "https://example.com/full",
+        }
+    ]
 
 
 def test_cleanup_filters_known_noise_lines() -> None:
