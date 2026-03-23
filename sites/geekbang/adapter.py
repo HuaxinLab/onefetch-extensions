@@ -9,6 +9,7 @@ from lxml import html
 
 from onefetch.adapters.base import BaseAdapter
 from onefetch.adapters.generic_html import GenericHtmlAdapter
+from onefetch.http import create_async_client
 from onefetch.models import FeedEntry
 from onefetch.router import normalize_url
 
@@ -29,9 +30,10 @@ class GeekbangAdapter(BaseAdapter):
             tree = html.fromstring(feed.raw_body or "")
             path = urlparse(url).path or ""
 
-            detail = self._extract_detail_content(tree)
+            detail_api = await self._extract_detail_via_api(url)
+            detail = self._extract_detail_content(tree) if not detail_api else None
             intro = self._extract_intro_content(tree) if not detail else None
-            chosen = detail or intro
+            chosen = detail_api or detail or intro
             if chosen:
                 if chosen.get("title"):
                     feed.title = str(chosen["title"]).strip()
@@ -47,7 +49,7 @@ class GeekbangAdapter(BaseAdapter):
                 feed.images = images
                 feed.metadata = {
                     **(feed.metadata or {}),
-                    "content_kind": "detail" if detail else "intro",
+                    "content_kind": "detail_api" if detail_api else ("detail" if detail else "intro"),
                     "path": path,
                 }
             feed.canonical_url = normalize_url(feed.canonical_url)
@@ -57,6 +59,73 @@ class GeekbangAdapter(BaseAdapter):
             # 解析失败时回退 generic_html 结果
             feed.crawler_id = self.id
             return feed
+
+    async def _extract_detail_via_api(self, url: str) -> dict | None:
+        article_id = self._detail_article_id(url)
+        if not article_id:
+            return None
+
+        cookie = GenericHtmlAdapter._load_cookie(url)
+        headers = {
+            "content-type": "application/json",
+            "origin": "https://b.geekbang.org",
+            "referer": url,
+        }
+        if cookie:
+            headers["cookie"] = cookie
+
+        try:
+            async with create_async_client(timeout=20, follow_redirects=True, headers=headers) as client:
+                resp = await client.post("https://b.geekbang.org/app/v1/article/detail", json={"article_id": article_id})
+                resp.raise_for_status()
+            payload = resp.json()
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                return None
+            article = data.get("article")
+            if not isinstance(article, dict):
+                return None
+            content_html = str(article.get("content") or "").strip()
+            content_md = str(article.get("content_md") or "").strip()
+            body = ""
+            images: list[dict] = []
+
+            # Prefer API HTML content to preserve richer structure (especially code indentation).
+            if content_html:
+                body, images = self._extract_api_html_body(content_html)
+                body = self._cleanup_body(body)
+
+            # Fallback to content_md when HTML body extraction fails.
+            if not body and content_md:
+                body, images = self._rewrite_markdown_images(content_md)
+                body = self._cleanup_body(body)
+
+            if not body:
+                return None
+
+            title = str(article.get("title") or "").strip()
+            author_info = data.get("author") or {}
+            author = str(author_info.get("name") or "").strip() if isinstance(author_info, dict) else ""
+            ctime = article.get("ctime")
+            published_at = self._parse_unix_ts(ctime)
+
+            return {
+                "title": title,
+                "author": author,
+                "published_at": published_at,
+                "body": body,
+                "images": images,
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_api_html_body(content_html: str) -> tuple[str, list[dict]]:
+        try:
+            root = html.fromstring(f"<div>{content_html}</div>")
+        except Exception:
+            return "", []
+        return GeekbangAdapter._extract_rich_body(root)
 
     @staticmethod
     def _extract_detail_content(tree) -> dict | None:
@@ -129,6 +198,69 @@ class GeekbangAdapter(BaseAdapter):
             "body": body,
             "images": images,
         }
+
+    @staticmethod
+    def _detail_article_id(url: str) -> str:
+        path = urlparse(url).path or ""
+        m = re.search(r"/member/course/detail/(\d+)", path)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _parse_unix_ts(value):
+        try:
+            ts = int(value)
+            if ts <= 0:
+                return None
+            return datetime.fromtimestamp(ts, tz=GeekbangAdapter._CST_TZ)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _rewrite_markdown_images(markdown: str) -> tuple[str, list[dict]]:
+        images: list[dict] = []
+        out_lines: list[str] = []
+        in_fence = False
+
+        linked_pat = re.compile(
+            r"\[!\[(?P<alt>[^\]]*)\]\((?P<src>https?://[^)\s]+)[^)]*\)\]\((?P<href>https?://[^)\s]+)[^)]*\)"
+        )
+        plain_pat = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>https?://[^)\s]+)[^)]*\)")
+
+        def _linked_replace(match: re.Match[str]) -> str:
+            images.append(
+                {
+                    "src": (match.group("src") or "").strip(),
+                    "alt": (match.group("alt") or "").strip(),
+                    "href": (match.group("href") or "").strip(),
+                }
+            )
+            return f"[IMG:{len(images)}]"
+
+        def _plain_replace(match: re.Match[str]) -> str:
+            images.append(
+                {
+                    "src": (match.group("src") or "").strip(),
+                    "alt": (match.group("alt") or "").strip(),
+                    "href": "",
+                }
+            )
+            return f"[IMG:{len(images)}]"
+
+        for raw in (markdown or "").splitlines():
+            line = raw.rstrip()
+            if line.strip().startswith("```"):
+                in_fence = not in_fence
+                out_lines.append(line)
+                continue
+            if in_fence:
+                out_lines.append(line)
+                continue
+
+            line = linked_pat.sub(_linked_replace, line)
+            line = plain_pat.sub(_plain_replace, line)
+            out_lines.append(line)
+
+        return "\n".join(out_lines), images
 
     @staticmethod
     def _extract_rich_body(node) -> tuple[str, list[dict]]:
@@ -328,6 +460,7 @@ class GeekbangAdapter(BaseAdapter):
         lang = GeekbangAdapter._detect_code_language(node)
         raw = (node.text_content() or "").replace("\u00a0", " ").replace("\u200b", "")
         raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+        raw = re.sub(r"(?:解释代码复制代码)\s*$", "", raw, flags=re.MULTILINE)
         lines = [line.rstrip() for line in raw.split("\n")]
         while lines and not lines[0].strip():
             lines.pop(0)
@@ -374,6 +507,13 @@ class GeekbangAdapter(BaseAdapter):
         if not lines:
             return False
         compact = [line for line in lines if line.strip()]
+        # If original block already has leading indentation, preserve it as-is.
+        if any(re.match(r"^[ \t]+", line) for line in compact):
+            return False
+        longest = max((len(line) for line in compact), default=0)
+        # Force reflow for extremely long single-line code blobs.
+        if len(compact) <= 3 and longest >= 220:
+            return True
         if len(compact) > 2:
             return False
         joined = "\n".join(compact).strip()
@@ -414,9 +554,16 @@ class GeekbangAdapter(BaseAdapter):
 
     @staticmethod
     def _reflow_compact_code(text: str) -> list[str]:
-        source = (text or "").strip()
+        source = (text or "").strip("\n")
         if not source:
             return []
+        # Remove copy-button leftovers frequently injected into Geekbang code blocks.
+        source = re.sub(r"(?:解释代码复制代码)\s*$", "", source, flags=re.MULTILINE)
+        # Reconstruct common Python/JS compacted lines.
+        source = re.sub(r"(?<!\n)(\b(?:from\s+[A-Za-z0-9_\.]+\s+import\s+))", r"\n\1", source)
+        source = re.sub(r"(?<!\n)(\bimport\s+[A-Za-z0-9_\.]+)", r"\n\1", source)
+        source = re.sub(r"(?<!\n)(?<![\s'\"`])#\s*", r"\n# ", source)
+        source = re.sub(r"\)\s*(?=[A-Za-z_][A-Za-z0-9_]*\s*=)", ")\n", source)
         source = re.sub(
             r"(?<!\n)\s+(def\s+[^\s\(]+\s*\()",
             r"\n\1",
@@ -447,6 +594,18 @@ class GeekbangAdapter(BaseAdapter):
             r"\n\1",
             source,
         )
+        # Many Geekbang code snippets are flattened into one line while preserving
+        # large runs of spaces that originally represented indentation/new lines.
+        # Recover likely line boundaries conservatively for Python/config-like snippets.
+        if source.count("\n") <= 1:
+            pythonish = any(tok in source for tok in ("def ", "class ", "import ", "return ", "async ", "await "))
+            if pythonish:
+                source = re.sub(
+                    r"[ \t]{2,}(?=(?:@|def |class |if |elif |else:|for |while |try:|except |finally:|with |return |from |import |async |await |\w+\s*=|\"[A-Za-z0-9_]+\"|#[^#]))",
+                    "\n",
+                    source,
+                )
+                source = re.sub(r"\)\s*(?=@)", ")\n", source)
 
         lines: list[str] = []
         buf: list[str] = []
@@ -458,9 +617,9 @@ class GeekbangAdapter(BaseAdapter):
 
         def flush_line(*, use_current_indent: bool = True) -> None:
             nonlocal buf
-            item = "".join(buf).strip()
+            item = "".join(buf).rstrip()
             buf = []
-            if not item:
+            if not item.strip():
                 return
             prefix = unit * (indent if use_current_indent else max(0, indent - 1))
             lines.append(prefix + item)
@@ -756,13 +915,17 @@ class GeekbangAdapter(BaseAdapter):
                 cleaned_lines.append("```" if item == "```" else item)
                 continue
             if in_fence:
-                cleaned_lines.append(line.rstrip())
+                code_line = re.sub(r"(?:解释代码复制代码)\s*$", "", line.rstrip())
+                cleaned_lines.append(code_line)
                 continue
             if not item:
                 if cleaned_lines and cleaned_lines[-1] != "":
                     cleaned_lines.append("")
                 continue
             if any(re.search(pattern, item) for pattern in noise_patterns):
+                continue
+            item = re.sub(r"(?:解释代码复制代码)\s*$", "", item).strip()
+            if not item:
                 continue
             if re.fullmatch(r"[-]+", item):
                 continue
