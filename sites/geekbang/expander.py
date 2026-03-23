@@ -13,9 +13,16 @@ class GeekbangCourseExpander:
         return host == "b.geekbang.org" and path.startswith("/member/course/intro/")
 
     def discover(self, seed_url: str, html_text: str) -> list[str]:
-        # 示例实现：从课程页 HTML 中提取 detail ID 并生成章节 URL
-        ids = []
-        for m in re.finditer(r'id="id(\d{5,})"', html_text or ""):
+        # 从课程页 HTML 中提取章节 detail ID（兼容 4/5/6 位）
+        ids: list[str] = []
+        text = html_text or ""
+
+        for m in re.finditer(r'id="id(\d{4,})"', text):
+            cid = m.group(1)
+            if cid not in ids:
+                ids.append(cid)
+
+        for m in re.finditer(r"/member/course/detail/(\d{4,})", text):
             cid = m.group(1)
             if cid not in ids:
                 ids.append(cid)
