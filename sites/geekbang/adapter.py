@@ -9,6 +9,7 @@ from lxml import html
 
 from onefetch.adapters.base import BaseAdapter
 from onefetch.adapters.generic_html import GenericHtmlAdapter
+from onefetch.credentials import get_cookie_for_url
 from onefetch.http import create_async_client
 from onefetch.models import FeedEntry
 from onefetch.router import normalize_url
@@ -65,7 +66,7 @@ class GeekbangAdapter(BaseAdapter):
         if not article_id:
             return None
 
-        cookie = GenericHtmlAdapter._load_cookie(url)
+        cookie = get_cookie_for_url(url)
         headers = {
             "content-type": "application/json",
             "origin": "https://b.geekbang.org",
